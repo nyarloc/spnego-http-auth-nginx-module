@@ -28,7 +28,7 @@ jobs:
           sudo apt-get install                                                \
             nginx nginx-dev build-essential libkrb5-dev curl                  \
             slapd ldap-utils                                                  \
-            krb5-admin-server	krb5-kdc krb5-kdc-ldap                          \
+            krb5-admin-server	krb5-kdc krb5-kdc-ldap krb5-config              \
             libsasl2-modules-gssapi-mit                                       \
             php-fpm php-ldap
 
