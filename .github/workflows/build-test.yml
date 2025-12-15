@@ -47,6 +47,7 @@ jobs:
             --with-cc-opt="-fPIC"                                             \
             --with-ld-opt="-Wl,-z,relro"                                      \
             "${NGX_CONF_FLAGS[@]}"                                            \
+            --with-debug                                                      \
             --add-dynamic-module="${{ github.workspace }}"                    \
             --builddir="${{ github.workspace }}/build"
 
