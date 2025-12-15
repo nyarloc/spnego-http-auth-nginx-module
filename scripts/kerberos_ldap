@@ -413,7 +413,7 @@ server {
                 auth_gss_service_name HTTP/${TEST_HOST_FQDN};
                 auth_gss_allow_basic_fallback off;
                 auth_gss_authorized_principal alice@${KERBEROS_REALM};
-                auth_gss_format_full on;
+                auth_gss_expose_sid on;
                 fastcgi_param HTTP_AUTHORIZATION "";
                 fastcgi_param KRB5CCNAME \$krb5_cc_name;
                 auth_gss_service_ccache /tmp/krb5cc_nginx;
@@ -428,7 +428,7 @@ server {
                 auth_gss_service_name HTTP/${TEST_HOST_FQDN};
                 auth_gss_allow_basic_fallback on;
                 auth_gss_authorized_principal bob@${KERBEROS_REALM};
-                auth_gss_format_full on;
+                auth_gss_expose_sid on;
                 fastcgi_param HTTP_AUTHORIZATION "";
                 fastcgi_param KRB5CCNAME \$krb5_cc_name;
                 auth_gss_service_ccache /tmp/krb5cc_nginx;
@@ -443,7 +443,7 @@ server {
                 auth_gss_service_name HTTP/${TEST_HOST_FQDN};
                 auth_gss_allow_basic_fallback off;
                 auth_gss_authorized_principal alice@${KERBEROS_REALM};
-                auth_gss_format_full on;
+                auth_gss_expose_sid on;
                 fastcgi_param HTTP_AUTHORIZATION "";
                 fastcgi_param KRB5CCNAME \$krb5_cc_name;
                 auth_gss_service_ccache /tmp/krb5cc_nginx;
