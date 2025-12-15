@@ -33,6 +33,7 @@
 
 #include <gssapi/gssapi.h>
 #include <gssapi/gssapi_krb5.h>
+#include <gssapi/gssapi_ext.h>
 #include <krb5.h>
 #include <stdbool.h>
 
