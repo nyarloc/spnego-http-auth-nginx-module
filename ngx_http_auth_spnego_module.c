@@ -99,6 +99,10 @@ static char *ngx_conf_set_regex_array_slot(ngx_conf_t *cf, ngx_command_t *cmd,
 
 ngx_int_t ngx_http_auth_spnego_set_bogus_authorization(ngx_http_request_t *r);
 
+static ngx_int_t ngx_http_auth_spnego_get_user_sid(ngx_http_request_t *r,
+                                                   gss_name_t client_name,
+                                                   ngx_str_t *sid_str);
+
 const char *get_gss_error(ngx_pool_t *p, OM_uint32 error_status, char *prefix) {
     OM_uint32 maj_stat, min_stat;
     OM_uint32 msg_ctx = 0;
@@ -158,6 +162,7 @@ typedef struct {
     ngx_flag_t map_to_local;
     ngx_flag_t delegate_credentials;
     ngx_flag_t constrained_delegation;
+    ngx_flag_t expose_sid;
 } ngx_http_auth_spnego_loc_conf_t;
 
 #define SPNEGO_NGX_CONF_FLAGS                                                  \
@@ -223,6 +228,10 @@ static ngx_command_t ngx_http_auth_spnego_commands[] = {
     {ngx_string("auth_gss_constrained_delegation"), SPNEGO_NGX_CONF_FLAGS,
      ngx_conf_set_flag_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_auth_spnego_loc_conf_t, constrained_delegation), NULL},
+
+    {ngx_string("auth_gss_expose_sid"), SPNEGO_NGX_CONF_FLAGS,
+    ngx_conf_set_flag_slot, NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_auth_spnego_loc_conf_t, expose_sid), NULL},
 
     ngx_null_command};
 
@@ -326,6 +335,7 @@ static void *ngx_http_auth_spnego_create_loc_conf(ngx_conf_t *cf) {
     conf->map_to_local = NGX_CONF_UNSET;
     conf->delegate_credentials = NGX_CONF_UNSET;
     conf->constrained_delegation = NGX_CONF_UNSET;
+    conf->expose_sid = NGX_CONF_UNSET;
 
     return conf;
 }
@@ -402,6 +412,7 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
                              prev->delegate_credentials, 0);
     ngx_conf_merge_off_value(conf->constrained_delegation,
                              prev->constrained_delegation, 0);
+    ngx_conf_merge_off_value(conf->expose_sid, prev->expose_sid, 0);
 
 #if (NGX_DEBUG)
     ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0, "auth_spnego: protect = %i",
@@ -455,6 +466,10 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
     ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0,
                        "auth_spnego: constrained_delegation = %i",
                        conf->constrained_delegation);
+
+    ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0,
+                       "auth_spnego: expose_sid = %i",
+                       conf->expose_sid);
 #endif
 
     return NGX_CONF_OK;
@@ -1603,8 +1618,24 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
     }
 
     if (output_token.length) {
-        /* Apply local rules to map Kerberos Principals to short names */
-        if (alcf->map_to_local) {
+        /* Check if we should expose SID instead of principal name */
+        if (alcf->expose_sid) {
+            ngx_str_t user_sid = ngx_null_string;
+
+            if (ngx_http_auth_spnego_get_user_sid(r, client_name, &user_sid) == NGX_OK
+                && user_sid.len > 0) {
+                /* Use SID as remote_user */
+                r->headers_in.user.data = user_sid.data;
+                r->headers_in.user.len = user_sid.len;
+                spnego_debug1("Using SID as remote_user: %V", &r->headers_in.user);
+                } else {
+                    spnego_log_error("Failed to get SID, falling back to principal name");
+                    goto use_principal_name;
+                }
+        } else {
+            use_principal_name:
+            /* Apply local rules to map Kerberos Principals to short names */
+            if (alcf->map_to_local) {
             gss_OID mech_type = discard_const(gss_mech_krb5);
             output_token = (gss_buffer_desc)GSS_C_EMPTY_BUFFER;
             major_status = gss_localname(&minor_status, client_name, mech_type,
@@ -1616,24 +1647,26 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
             }
         }
 
-        /* TOFIX dirty quick trick for now (no "-1" i.e. include '\0' */
-        ngx_str_t user = {output_token.length, (u_char *)output_token.value};
+            /* TOFIX dirty quick trick for now (no "-1" i.e. include '\0' */
+            ngx_str_t user = {output_token.length, (u_char *)output_token.value};
 
-        r->headers_in.user.data = ngx_pstrdup(r->pool, &user);
-        if (NULL == r->headers_in.user.data) {
-            spnego_log_error("ngx_pstrdup failed to allocate");
-            spnego_error(NGX_ERROR);
-        }
+            r->headers_in.user.data = ngx_pstrdup(r->pool, &user);
+            if (NULL == r->headers_in.user.data) {
+                spnego_log_error("ngx_pstrdup failed to allocate");
+                spnego_error(NGX_ERROR);
+            }
 
-        r->headers_in.user.len = user.len;
-        if (alcf->fqun == 0) {
-            pu = ngx_strlchr(r->headers_in.user.data,
-                             r->headers_in.user.data + r->headers_in.user.len,
-                             '@');
-            if (pu != NULL &&
-                ngx_strncmp(pu + 1, alcf->realm.data, alcf->realm.len) == 0) {
-                *pu = '\0';
-                r->headers_in.user.len = ngx_strlen(r->headers_in.user.data);
+            r->headers_in.user.len = user.len;
+            if (alcf->fqun == 0)
+            {
+                pu = ngx_strlchr(r->headers_in.user.data,
+                                r->headers_in.user.data + r->headers_in.user.len,
+                                '@');
+                if (pu != NULL &&
+                    ngx_strncmp(pu + 1, alcf->realm.data, alcf->realm.len) == 0) {
+                    *pu = '\0';
+                    r->headers_in.user.len = ngx_strlen(r->headers_in.user.data);
+                    }
             }
         }
 
@@ -1807,4 +1840,56 @@ static ngx_int_t ngx_http_auth_spnego_handler(ngx_http_request_t *r) {
     spnego_debug3("SSO auth handling OUT: token.len=%d, head=%d, ret=%d",
                   ctx->token.len, ctx->head, ctx->ret);
     return ctx->ret;
+}
+
+static ngx_int_t
+ngx_http_auth_spnego_get_user_sid(ngx_http_request_t *r,
+                                  gss_name_t client_name,
+                                  ngx_str_t *sid_str) {
+    OM_uint32 major_status, minor_status;
+    gss_buffer_desc attr_name = GSS_C_EMPTY_BUFFER;
+    gss_buffer_desc value = GSS_C_EMPTY_BUFFER;
+    gss_buffer_desc display_value = GSS_C_EMPTY_BUFFER;
+    int authenticated = 0;
+    int complete = 0;
+    int more = -1;
+
+    /* The PAC SID attribute name */
+    const char *sid_attr = "urn:mspac:logon-info:user-sid";
+
+    attr_name.value = (void *)sid_attr;
+    attr_name.length = strlen(sid_attr);
+
+    major_status = gss_get_name_attribute(&minor_status,
+                                          client_name,
+                                          &attr_name,
+                                          &authenticated,
+                                          &complete,
+                                          &value,
+                                          &display_value,
+                                          &more);
+
+    if (GSS_ERROR(major_status)) {
+        spnego_log_error("%s", get_gss_error(r->pool, minor_status,
+                         "gss_get_name_attribute() failed for SID"));
+        return NGX_ERROR;
+    }
+
+    if (display_value.length > 0) {
+        sid_str->data = ngx_pnalloc(r->pool, display_value.length + 1);
+        if (sid_str->data == NULL) {
+            gss_release_buffer(&minor_status, &value);
+            gss_release_buffer(&minor_status, &display_value);
+            return NGX_ERROR;
+        }
+
+        ngx_memcpy(sid_str->data, display_value.value, display_value.length);
+        sid_str->data[display_value.length] = '\0';
+        sid_str->len = display_value.length;
+    }
+
+    gss_release_buffer(&minor_status, &value);
+    gss_release_buffer(&minor_status, &display_value);
+
+    return NGX_OK;
 }
