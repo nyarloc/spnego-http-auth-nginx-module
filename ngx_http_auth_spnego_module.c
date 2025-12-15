@@ -1853,15 +1853,15 @@ static void ngx_http_auth_spnego_debug_pac_attrs(ngx_http_request_t *r,
                                     &is_mechname, NULL, &attrs);
 
     if (!GSS_ERROR(major_status) && attrs != GSS_C_NO_BUFFER_SET) {
-        spnego_debug1("Available PAC attributes: %d", (int)attrs->count);
+        ngx_log_debug1("Available PAC attributes: %d", (int)attrs->count);
         for (size_t i = 0; i < attrs->count; i++) {
-            spnego_debug2("  [%d] %*s", (int)i,
+            ngx_log_debug3("  [%d] %*s", (int)i,
                          (int)attrs->elements[i].length,
                          (char *)attrs->elements[i].value);
         }
         gss_release_buffer_set(&minor_status, &attrs);
     } else {
-        spnego_debug0("No PAC attributes available");
+        ngx_log_debug0("No PAC attributes available");
     }
 }
 
