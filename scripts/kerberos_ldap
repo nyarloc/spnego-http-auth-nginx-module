@@ -75,6 +75,8 @@ EOF
 
 
 echo ""
+echo "krb5-config:"
+krb5-config --version
 echo "=== Initial setup ==="
 echo ""
 printf "Setting host FQDN to %s ... " "${TEST_HOST_FQDN}"
