@@ -1933,6 +1933,8 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
                                           ngx_str_t *sid_str) {
     const unsigned char *ptr = pac_data;
     const unsigned char *end = pac_data + pac_len;
+    uint32_t user_rid = 0;
+    ngx_str_t domain_sid = ngx_null_string;
 
     /* KERB_VALIDATION_INFO structure (NDR encoded)
      * Offset 0x00: FILETIME LogonTime (8 bytes)
@@ -1949,7 +1951,7 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
      * Offset 0x58: RPC_UNICODE_STRING HomeDirectoryDrive
      * Offset 0x60: USHORT LogonCount
      * Offset 0x62: USHORT BadPasswordCount
-     * Offset 0x64: ULONG UserId (RID)
+     * Offset 0x64: ULONG UserId (RID) <-- USER RID HERE
      * Offset 0x68: ULONG PrimaryGroupId
      * Offset 0x6C: ULONG GroupCount
      * Offset 0x70: PGROUP_MEMBERSHIP GroupIds (pointer)
@@ -1957,16 +1959,24 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
      * Offset 0x78: USER_SESSION_KEY UserSessionKey (16 bytes)
      * Offset 0x88: RPC_UNICODE_STRING LogonServer
      * Offset 0x90: RPC_UNICODE_STRING LogonDomainName
-     * Offset 0x98: PRPC_SID LogonDomainId (pointer to SID)
+     * Offset 0x98: PRPC_SID LogonDomainId (pointer to domain SID)
      */
 
-    /* Skip to LogonDomainId pointer at offset 0x98 */
+    /* Read UserId (RID) at offset 0x64 */
+    if (pac_len < 0x68) {
+        spnego_log_error("PAC KERB_VALIDATION_INFO too short to read RID: %d bytes", (int)pac_len);
+        return NGX_ERROR;
+    }
+
+    user_rid = read_uint32_le(pac_data + 0x64);
+    spnego_debug1("Extracted user RID: %ud", user_rid);
+
+    /* Read LogonDomainId pointer at offset 0x98 */
     if (pac_len < 0x9C) {
         spnego_log_error("PAC KERB_VALIDATION_INFO too short: %d bytes", (int)pac_len);
         return NGX_ERROR;
     }
 
-    /* Read LogonDomainId pointer (offset 0x98) */
     uint32_t logon_domain_id_ptr = read_uint32_le(pac_data + 0x98);
 
     if (logon_domain_id_ptr == 0) {
@@ -1974,12 +1984,7 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
-    /* In NDR encoding, pointers are typically followed by their data
-     * We need to find the actual SID data in the buffer
-     * The SID structure starts after the fixed portion of KERB_VALIDATION_INFO
-     * and the variable-length string data */
-
-    /* Try to locate SID by scanning for SID structure signature */
+    /* Try to locate domain SID by scanning for SID structure signature */
     /* SID starts with: revision (0x01) + sub_auth_count (typically 0x04 or 0x05) + authority */
     ptr = pac_data + 0x100; /* Start searching after fixed structure */
 
@@ -1992,13 +1997,34 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
                 ptr[5] == 0x00 && ptr[6] == 0x00 && ptr[7] == 0x05) {
 
                 unsigned char sub_auth_count = ptr[1];
-                size_t sid_len = 8 + sub_auth_count * 4;
+                size_t domain_sid_len = 8 + sub_auth_count * 4;
 
-                if (ptr + sid_len <= end) {
-                    spnego_debug2("Found potential SID at offset %d, length %d",
-                                 (int)(ptr - pac_data), (int)sid_len);
+                if (ptr + domain_sid_len <= end) {
+                    spnego_debug2("Found domain SID at offset %d, length %d",
+                                 (int)(ptr - pac_data), (int)domain_sid_len);
 
-                    return ngx_http_auth_spnego_sid_to_string(r, ptr, sid_len, sid_str);
+                    /* Convert domain SID to string */
+                    if (ngx_http_auth_spnego_sid_to_string(r, ptr, domain_sid_len, &domain_sid) != NGX_OK) {
+                        spnego_log_error("Failed to convert domain SID to string");
+                        return NGX_ERROR;
+                    }
+
+                    /* Append user RID to domain SID to form complete user SID */
+                    size_t full_sid_len = domain_sid.len + 11; /* "-" + max 10 digits for RID */
+                    sid_str->data = ngx_pnalloc(r->pool, full_sid_len);
+                    if (sid_str->data == NULL) {
+                        return NGX_ERROR;
+                    }
+
+                    u_char *p = sid_str->data;
+                    p = ngx_slprintf(p, sid_str->data + full_sid_len, "%V-%ud",
+                                    &domain_sid, user_rid);
+                    sid_str->len = p - sid_str->data;
+
+                    spnego_debug2("Complete user SID (domain + RID): %V (RID=%ud)",
+                                 sid_str, user_rid);
+
+                    return NGX_OK;
                 }
             }
         }
@@ -2006,7 +2032,6 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
     }
 
     /* Alternative: Try direct offset calculation based on NDR alignment */
-    /* The actual SID is typically at a predictable offset after strings */
     size_t estimated_offset = 0x100; /* After fixed fields and some strings */
 
     if (pac_len > estimated_offset + 28) { /* 28 = minimum domain SID size */
@@ -2019,16 +2044,36 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
                 ptr[5] == 0x00 && ptr[6] == 0x00 && ptr[7] == 0x05) {
 
                 unsigned char sub_auth_count = ptr[1];
-                size_t sid_len = 8 + sub_auth_count * 4;
+                size_t domain_sid_len = 8 + sub_auth_count * 4;
 
-                if (ptr + sid_len <= end) {
-                    return ngx_http_auth_spnego_sid_to_string(r, ptr, sid_len, sid_str);
+                if (ptr + domain_sid_len <= end) {
+                    /* Convert domain SID to string */
+                    if (ngx_http_auth_spnego_sid_to_string(r, ptr, domain_sid_len, &domain_sid) != NGX_OK) {
+                        continue; /* Try next offset */
+                    }
+
+                    /* Append user RID to domain SID */
+                    size_t full_sid_len = domain_sid.len + 11;
+                    sid_str->data = ngx_pnalloc(r->pool, full_sid_len);
+                    if (sid_str->data == NULL) {
+                        return NGX_ERROR;
+                    }
+
+                    u_char *p = sid_str->data;
+                    p = ngx_slprintf(p, sid_str->data + full_sid_len, "%V-%ud",
+                                    &domain_sid, user_rid);
+                    sid_str->len = p - sid_str->data;
+
+                    spnego_debug2("Complete user SID (domain + RID): %V (RID=%ud)",
+                                 sid_str, user_rid);
+
+                    return NGX_OK;
                 }
             }
         }
     }
 
-    spnego_log_error("Could not locate SID in PAC KERB_VALIDATION_INFO");
+    spnego_log_error("Could not locate domain SID in PAC KERB_VALIDATION_INFO");
     return NGX_ERROR;
 }
 
