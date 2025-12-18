@@ -1945,11 +1945,6 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
 
     /* Dump first part of PAC data for debugging */
     spnego_debug1("PAC data length: %d bytes", (int)pac_len);
-    if (pac_len >= 0x68) {
-        spnego_debug1("PAC data at 0x60-0x67: %02x %02x %02x %02x %02x %02x %02x %02x",
-                     pac_data[0x60], pac_data[0x61], pac_data[0x62], pac_data[0x63],
-                     pac_data[0x64], pac_data[0x65], pac_data[0x66], pac_data[0x67]);
-    }
 
     /* Try multiple possible RID offsets due to NDR alignment variations */
     uint32_t possible_rids[4];
