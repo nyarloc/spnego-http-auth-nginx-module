@@ -1965,12 +1965,6 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
         possible_rids[rid_count++] = read_uint32_le(pac_data + 0x60);
     }
 
-    /* Log all possible RIDs */
-    for (int i = 0; i < rid_count; i++) {
-        spnego_debug1("Possible RID at index %d: %ud (0x%08x)",
-                     i, possible_rids[i], possible_rids[i]);
-    }
-
     /* Search for domain SID in the PAC data */
     ptr = pac_data + 0xA0; /* Start searching after known fixed fields */
 
@@ -1984,8 +1978,6 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
             size_t sid_len = 8 + sub_auth_count * 4;
 
             if (ptr + sid_len <= end) {
-                spnego_debug1("Found potential domain SID at offset %d (0x%x)",
-                             (int)(ptr - pac_data), (int)(ptr - pac_data));
 
                 /* This is likely the domain SID, save it */
                 domain_sid_ptr = ptr;
@@ -1997,7 +1989,6 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
                     /* Valid RIDs are typically > 500 and < 100000000 */
                     if (possible_rids[i] >= 500 && possible_rids[i] < 100000000) {
                         user_rid = possible_rids[i];
-                        spnego_debug1("Selected RID %ud from index %d", user_rid, i);
                         break;
                     }
                 }
@@ -2007,8 +1998,6 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
                     for (int i = 0; i < rid_count; i++) {
                         if (possible_rids[i] != 0) {
                             user_rid = possible_rids[i];
-                            spnego_debug1("Using first non-zero RID %ud from index %d",
-                                        user_rid, i);
                             break;
                         }
                     }
@@ -2034,8 +2023,6 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
                 if (ptr + sid_len <= end) {
                     domain_sid_ptr = ptr;
                     domain_sid_len = sid_len;
-                    spnego_debug1("Found domain SID (broader search) at offset %d (0x%x)",
-                                 (int)(ptr - pac_data), (int)(ptr - pac_data));
 
                     /* Use first non-zero RID */
                     if (user_rid == 0) {
