@@ -1933,8 +1933,6 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
                                           ngx_str_t *sid_str) {
     const unsigned char *ptr = pac_data;
     const unsigned char *end = pac_data + pac_len;
-    uint32_t offset;
-    uint32_t count;
 
     /* KERB_VALIDATION_INFO structure (NDR encoded)
      * Offset 0x00: FILETIME LogonTime (8 bytes)
@@ -2120,7 +2118,7 @@ ngx_http_auth_spnego_get_user_sid(ngx_http_request_t *r,
         }
 
         /* Parse the binary PAC data to extract SID */
-        ngx_log_debug0("Parsing binary PAC data (%d bytes) to extract SID",
+        spnego_debug1("Parsing binary PAC data (%d bytes) to extract SID",
                      (int)value.length);
 
         ngx_int_t result = ngx_http_auth_spnego_parse_pac_logon_info(
