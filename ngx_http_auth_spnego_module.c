@@ -2120,7 +2120,7 @@ ngx_http_auth_spnego_get_user_sid(ngx_http_request_t *r,
         }
 
         /* Parse the binary PAC data to extract SID */
-        spnego_debug2("Parsing binary PAC data (%d bytes) to extract SID",
+        ngx_log_debug2("Parsing binary PAC data (%d bytes) to extract SID",
                      (int)value.length);
 
         ngx_int_t result = ngx_http_auth_spnego_parse_pac_logon_info(
