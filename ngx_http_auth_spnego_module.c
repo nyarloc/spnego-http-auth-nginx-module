@@ -1851,18 +1851,6 @@ static uint32_t read_uint32_le(const unsigned char *data) {
            ((uint32_t)data[3] << 24);
 }
 
-/* Read little-endian 64-bit value */
-static uint64_t read_uint64_le(const unsigned char *data) {
-    return ((uint64_t)data[0]) |
-           ((uint64_t)data[1] << 8) |
-           ((uint64_t)data[2] << 16) |
-           ((uint64_t)data[3] << 24) |
-           ((uint64_t)data[4] << 32) |
-           ((uint64_t)data[5] << 40) |
-           ((uint64_t)data[6] << 48) |
-           ((uint64_t)data[7] << 56);
-}
-
 /* Convert binary SID to string format (S-1-5-21-...) */
 static ngx_int_t
 ngx_http_auth_spnego_sid_to_string(ngx_http_request_t *r,
