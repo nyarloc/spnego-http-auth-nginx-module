@@ -1843,6 +1843,209 @@ static ngx_int_t ngx_http_auth_spnego_handler(ngx_http_request_t *r) {
     return ctx->ret;
 }
 
+/* Read little-endian 32-bit value */
+static uint32_t read_uint32_le(const unsigned char *data) {
+    return ((uint32_t)data[0]) |
+           ((uint32_t)data[1] << 8) |
+           ((uint32_t)data[2] << 16) |
+           ((uint32_t)data[3] << 24);
+}
+
+/* Read little-endian 64-bit value */
+static uint64_t read_uint64_le(const unsigned char *data) {
+    return ((uint64_t)data[0]) |
+           ((uint64_t)data[1] << 8) |
+           ((uint64_t)data[2] << 16) |
+           ((uint64_t)data[3] << 24) |
+           ((uint64_t)data[4] << 32) |
+           ((uint64_t)data[5] << 40) |
+           ((uint64_t)data[6] << 48) |
+           ((uint64_t)data[7] << 56);
+}
+
+/* Convert binary SID to string format (S-1-5-21-...) */
+static ngx_int_t
+ngx_http_auth_spnego_sid_to_string(ngx_http_request_t *r,
+                                   const unsigned char *sid_data,
+                                   size_t sid_len,
+                                   ngx_str_t *sid_str) {
+    unsigned char revision;
+    unsigned char sub_auth_count;
+    uint64_t identifier_authority;
+    uint32_t sub_authorities[15]; /* Max 15 sub-authorities per spec */
+    size_t str_len;
+    u_char *p;
+
+    /* Minimum SID structure: 1 (revision) + 1 (count) + 6 (authority) + 4 (one sub-auth) = 12 bytes */
+    if (sid_len < 12) {
+        spnego_log_error("SID data too short: %d bytes", (int)sid_len);
+        return NGX_ERROR;
+    }
+
+    revision = sid_data[0];
+    sub_auth_count = sid_data[1];
+
+    if (revision != 1) {
+        spnego_log_error("Unsupported SID revision: %d", (int)revision);
+        return NGX_ERROR;
+    }
+
+    if (sub_auth_count > 15) {
+        spnego_log_error("Invalid SID sub-authority count: %d", (int)sub_auth_count);
+        return NGX_ERROR;
+    }
+
+    /* Check we have enough data */
+    if (sid_len < (size_t)(8 + sub_auth_count * 4)) {
+        spnego_log_error("SID data truncated");
+        return NGX_ERROR;
+    }
+
+    /* Read identifier authority (6 bytes, big-endian) */
+    identifier_authority = 0;
+    for (int i = 0; i < 6; i++) {
+        identifier_authority = (identifier_authority << 8) | sid_data[2 + i];
+    }
+
+    /* Read sub-authorities (little-endian 32-bit values) */
+    for (int i = 0; i < sub_auth_count; i++) {
+        sub_authorities[i] = read_uint32_le(&sid_data[8 + i * 4]);
+    }
+
+    /* Calculate string length: "S-1-" + authority + sub-authorities */
+    /* Max: S-1-281474976710655-4294967295-...-4294967295 */
+    str_len = 4 + 20 + sub_auth_count * 11; /* Conservative estimate */
+
+    sid_str->data = ngx_pnalloc(r->pool, str_len);
+    if (sid_str->data == NULL) {
+        return NGX_ERROR;
+    }
+
+    /* Format SID string */
+    p = sid_str->data;
+    p = ngx_slprintf(p, sid_str->data + str_len, "S-%d-%uL",
+                     (int)revision, identifier_authority);
+
+    for (int i = 0; i < sub_auth_count; i++) {
+        p = ngx_slprintf(p, sid_str->data + str_len, "-%ud", sub_authorities[i]);
+    }
+
+    sid_str->len = p - sid_str->data;
+
+    spnego_debug1("Converted binary SID to string: %V", sid_str);
+
+    return NGX_OK;
+}
+
+/* Parse KERB_VALIDATION_INFO structure to extract user SID */
+static ngx_int_t
+ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
+                                          const unsigned char *pac_data,
+                                          size_t pac_len,
+                                          ngx_str_t *sid_str) {
+    const unsigned char *ptr = pac_data;
+    const unsigned char *end = pac_data + pac_len;
+    uint32_t offset;
+    uint32_t count;
+
+    /* KERB_VALIDATION_INFO structure (NDR encoded)
+     * Offset 0x00: FILETIME LogonTime (8 bytes)
+     * Offset 0x08: FILETIME LogoffTime (8 bytes)
+     * Offset 0x10: FILETIME KickOffTime (8 bytes)
+     * Offset 0x18: FILETIME PasswordLastSet (8 bytes)
+     * Offset 0x20: FILETIME PasswordCanChange (8 bytes)
+     * Offset 0x28: FILETIME PasswordMustChange (8 bytes)
+     * Offset 0x30: RPC_UNICODE_STRING EffectiveName (8 bytes: MaxLength, Length, Pointer)
+     * Offset 0x38: RPC_UNICODE_STRING FullName
+     * Offset 0x40: RPC_UNICODE_STRING LogonScript
+     * Offset 0x48: RPC_UNICODE_STRING ProfilePath
+     * Offset 0x50: RPC_UNICODE_STRING HomeDirectory
+     * Offset 0x58: RPC_UNICODE_STRING HomeDirectoryDrive
+     * Offset 0x60: USHORT LogonCount
+     * Offset 0x62: USHORT BadPasswordCount
+     * Offset 0x64: ULONG UserId (RID)
+     * Offset 0x68: ULONG PrimaryGroupId
+     * Offset 0x6C: ULONG GroupCount
+     * Offset 0x70: PGROUP_MEMBERSHIP GroupIds (pointer)
+     * Offset 0x74: ULONG UserFlags
+     * Offset 0x78: USER_SESSION_KEY UserSessionKey (16 bytes)
+     * Offset 0x88: RPC_UNICODE_STRING LogonServer
+     * Offset 0x90: RPC_UNICODE_STRING LogonDomainName
+     * Offset 0x98: PRPC_SID LogonDomainId (pointer to SID)
+     */
+
+    /* Skip to LogonDomainId pointer at offset 0x98 */
+    if (pac_len < 0x9C) {
+        spnego_log_error("PAC KERB_VALIDATION_INFO too short: %d bytes", (int)pac_len);
+        return NGX_ERROR;
+    }
+
+    /* Read LogonDomainId pointer (offset 0x98) */
+    uint32_t logon_domain_id_ptr = read_uint32_le(pac_data + 0x98);
+
+    if (logon_domain_id_ptr == 0) {
+        spnego_log_error("LogonDomainId pointer is NULL");
+        return NGX_ERROR;
+    }
+
+    /* In NDR encoding, pointers are typically followed by their data
+     * We need to find the actual SID data in the buffer
+     * The SID structure starts after the fixed portion of KERB_VALIDATION_INFO
+     * and the variable-length string data */
+
+    /* Try to locate SID by scanning for SID structure signature */
+    /* SID starts with: revision (0x01) + sub_auth_count (typically 0x04 or 0x05) + authority */
+    ptr = pac_data + 0x100; /* Start searching after fixed structure */
+
+    while (ptr < end - 12) {
+        /* Check for SID signature: revision = 1, reasonable sub_auth_count */
+        if (ptr[0] == 0x01 && ptr[1] >= 0x01 && ptr[1] <= 0x0F) {
+            /* Potential SID found - verify identifier authority */
+            /* Common Windows authority: 0x000005 (NT AUTHORITY) */
+            if (ptr[2] == 0x00 && ptr[3] == 0x00 && ptr[4] == 0x00 &&
+                ptr[5] == 0x00 && ptr[6] == 0x00 && ptr[7] == 0x05) {
+
+                unsigned char sub_auth_count = ptr[1];
+                size_t sid_len = 8 + sub_auth_count * 4;
+
+                if (ptr + sid_len <= end) {
+                    spnego_debug2("Found potential SID at offset %d, length %d",
+                                 (int)(ptr - pac_data), (int)sid_len);
+
+                    return ngx_http_auth_spnego_sid_to_string(r, ptr, sid_len, sid_str);
+                }
+            }
+        }
+        ptr++;
+    }
+
+    /* Alternative: Try direct offset calculation based on NDR alignment */
+    /* The actual SID is typically at a predictable offset after strings */
+    size_t estimated_offset = 0x100; /* After fixed fields and some strings */
+
+    if (pac_len > estimated_offset + 28) { /* 28 = minimum domain SID size */
+        ptr = pac_data + estimated_offset;
+
+        /* Try a few common offsets */
+        for (int attempt = 0; attempt < 10 && ptr < end - 28; attempt++, ptr += 4) {
+            if (ptr[0] == 0x01 && ptr[1] >= 0x01 && ptr[1] <= 0x0F &&
+                ptr[2] == 0x00 && ptr[3] == 0x00 && ptr[4] == 0x00 &&
+                ptr[5] == 0x00 && ptr[6] == 0x00 && ptr[7] == 0x05) {
+
+                unsigned char sub_auth_count = ptr[1];
+                size_t sid_len = 8 + sub_auth_count * 4;
+
+                if (ptr + sid_len <= end) {
+                    return ngx_http_auth_spnego_sid_to_string(r, ptr, sid_len, sid_str);
+                }
+            }
+        }
+    }
+
+    spnego_log_error("Could not locate SID in PAC KERB_VALIDATION_INFO");
+    return NGX_ERROR;
+}
+
 static void ngx_http_auth_spnego_debug_pac_attrs(ngx_http_request_t *r,
                                                  gss_name_t client_name) {
     OM_uint32 major_status, minor_status;
@@ -1908,11 +2111,6 @@ ngx_http_auth_spnego_get_user_sid(ngx_http_request_t *r,
 
     /* The MS PAC data is in the value buffer as binary data */
     if (value.length > 0) {
-        /* For MS PAC, we need to extract the logon info which contains the SID
-         * The SID is typically at a specific offset in the PAC structure
-         * MS PAC format: we need to parse the KERB_VALIDATION_INFO structure
-         */
-        
         /* Try to use display_value first if available */
         if (display_value.length > 0) {
             sid_str->data = ngx_pnalloc(r->pool, display_value.length + 1);
@@ -1927,17 +2125,26 @@ ngx_http_auth_spnego_get_user_sid(ngx_http_request_t *r,
             sid_str->len = display_value.length;
 
             spnego_debug1("Retrieved SID from display_value: %V", sid_str);
-            
+
             gss_release_buffer(&minor_status, &value);
             gss_release_buffer(&minor_status, &display_value);
             return NGX_OK;
         }
 
-        /* If display_value is not available, parse the binary PAC data */
-        /* This requires parsing the KERB_VALIDATION_INFO structure */
-        spnego_log_error("PAC data available but no display value. Binary PAC parsing not yet implemented.");
+        /* Parse the binary PAC data to extract SID */
+        spnego_debug2("Parsing binary PAC data (%d bytes) to extract SID",
+                     (int)value.length);
+
+        ngx_int_t result = ngx_http_auth_spnego_parse_pac_logon_info(
+            r, (const unsigned char *)value.value, value.length, sid_str);
+
         gss_release_buffer(&minor_status, &value);
-        return NGX_ERROR;
+
+        if (result == NGX_OK) {
+            return NGX_OK;
+        }
+
+        spnego_log_error("Failed to parse binary PAC data for SID");
     }
 
     /* Alternative approach: try specific logon_info attribute */
@@ -1959,23 +2166,37 @@ ngx_http_auth_spnego_get_user_sid(ngx_http_request_t *r,
                                           &display_value,
                                           &more);
 
-    if (!GSS_ERROR(major_status) && display_value.length > 0) {
-        sid_str->data = ngx_pnalloc(r->pool, display_value.length + 1);
-        if (sid_str->data == NULL) {
+    if (!GSS_ERROR(major_status)) {
+        if (display_value.length > 0) {
+            sid_str->data = ngx_pnalloc(r->pool, display_value.length + 1);
+            if (sid_str->data == NULL) {
+                gss_release_buffer(&minor_status, &value);
+                gss_release_buffer(&minor_status, &display_value);
+                return NGX_ERROR;
+            }
+
+            ngx_memcpy(sid_str->data, display_value.value, display_value.length);
+            sid_str->data[display_value.length] = '\0';
+            sid_str->len = display_value.length;
+
+            spnego_debug1("Retrieved SID from logon_info display_value: %V", sid_str);
+
             gss_release_buffer(&minor_status, &value);
             gss_release_buffer(&minor_status, &display_value);
-            return NGX_ERROR;
+            return NGX_OK;
         }
 
-        ngx_memcpy(sid_str->data, display_value.value, display_value.length);
-        sid_str->data[display_value.length] = '\0';
-        sid_str->len = display_value.length;
+        if (value.length > 0) {
+            /* Parse binary logon_info data */
+            ngx_int_t result = ngx_http_auth_spnego_parse_pac_logon_info(
+                r, (const unsigned char *)value.value, value.length, sid_str);
 
-        spnego_debug1("Retrieved SID from logon_info: %V", sid_str);
+            gss_release_buffer(&minor_status, &value);
 
-        gss_release_buffer(&minor_status, &value);
-        gss_release_buffer(&minor_status, &display_value);
-        return NGX_OK;
+            if (result == NGX_OK) {
+                return NGX_OK;
+            }
+        }
     }
 
     if (value.length > 0 || display_value.length > 0) {
