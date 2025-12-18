@@ -1868,6 +1868,7 @@ static void ngx_http_auth_spnego_debug_pac_attrs(ngx_http_request_t *r,
     }
 }
 
+
 static ngx_int_t
 ngx_http_auth_spnego_get_user_sid(ngx_http_request_t *r,
                                   gss_name_t client_name,
@@ -1882,31 +1883,38 @@ ngx_http_auth_spnego_get_user_sid(ngx_http_request_t *r,
 
     /* Debug: list available attributes */
     ngx_http_auth_spnego_debug_pac_attrs(r, client_name);
-    /* Try different PAC attribute names */
-    const char *sid_attrs[] = {
-        "urn:mspac:logon_info:user_sid",  /* Note: underscore, not dash */
-        "urn:mspac:logon-info:user-sid",
-        "urn:mspac:sid",
-        "urn:mspac:user-sid",
-        NULL
-    };
 
-    for (int i = 0; sid_attrs[i] != NULL; i++) {
-        attr_name.value = (void *)sid_attrs[i];
-        attr_name.length = strlen(sid_attrs[i]);
+    /* The correct MS PAC attribute for user SID */
+    const char *sid_attr = "urn:mspac:";
+    attr_name.value = (void *)sid_attr;
+    attr_name.length = strlen(sid_attr);
 
-        spnego_debug1("Trying PAC attribute: %s", sid_attrs[i]);
+    spnego_debug1("Attempting to retrieve PAC attributes with: %s", sid_attr);
 
-        major_status = gss_get_name_attribute(&minor_status,
-                                              client_name,
-                                              &attr_name,
-                                              &authenticated,
-                                              &complete,
-                                              &value,
-                                              &display_value,
-                                              &more);
+    major_status = gss_get_name_attribute(&minor_status,
+                                          client_name,
+                                          &attr_name,
+                                          &authenticated,
+                                          &complete,
+                                          &value,
+                                          &display_value,
+                                          &more);
 
-        if (!GSS_ERROR(major_status) && display_value.length > 0) {
+    if (GSS_ERROR(major_status)) {
+        spnego_log_error("Failed to get PAC attributes: %s",
+                        get_gss_error(r->pool, minor_status, "gss_get_name_attribute()"));
+        return NGX_ERROR;
+    }
+
+    /* The MS PAC data is in the value buffer as binary data */
+    if (value.length > 0) {
+        /* For MS PAC, we need to extract the logon info which contains the SID
+         * The SID is typically at a specific offset in the PAC structure
+         * MS PAC format: we need to parse the KERB_VALIDATION_INFO structure
+         */
+        
+        /* Try to use display_value first if available */
+        if (display_value.length > 0) {
             sid_str->data = ngx_pnalloc(r->pool, display_value.length + 1);
             if (sid_str->data == NULL) {
                 gss_release_buffer(&minor_status, &value);
@@ -1918,17 +1926,63 @@ ngx_http_auth_spnego_get_user_sid(ngx_http_request_t *r,
             sid_str->data[display_value.length] = '\0';
             sid_str->len = display_value.length;
 
-            spnego_debug2("Found SID using attribute %s: %V", sid_attrs[i], sid_str);
-
+            spnego_debug1("Retrieved SID from display_value: %V", sid_str);
+            
             gss_release_buffer(&minor_status, &value);
             gss_release_buffer(&minor_status, &display_value);
             return NGX_OK;
         }
 
-        spnego_debug2("Attribute %s failed: %s", sid_attrs[i],
-                     get_gss_error(r->pool, minor_status, "gss_get_name_attribute()"));
+        /* If display_value is not available, parse the binary PAC data */
+        /* This requires parsing the KERB_VALIDATION_INFO structure */
+        spnego_log_error("PAC data available but no display value. Binary PAC parsing not yet implemented.");
+        gss_release_buffer(&minor_status, &value);
+        return NGX_ERROR;
     }
 
-    spnego_log_error("No SID found in PAC data. Ensure Active Directory is sending MS-PAC");
+    /* Alternative approach: try specific logon_info attribute */
+    const char *logon_info_attr = "urn:mspac:logon_info";
+    attr_name.value = (void *)logon_info_attr;
+    attr_name.length = strlen(logon_info_attr);
+
+    value = (gss_buffer_desc)GSS_C_EMPTY_BUFFER;
+    display_value = (gss_buffer_desc)GSS_C_EMPTY_BUFFER;
+
+    spnego_debug1("Trying specific attribute: %s", logon_info_attr);
+
+    major_status = gss_get_name_attribute(&minor_status,
+                                          client_name,
+                                          &attr_name,
+                                          &authenticated,
+                                          &complete,
+                                          &value,
+                                          &display_value,
+                                          &more);
+
+    if (!GSS_ERROR(major_status) && display_value.length > 0) {
+        sid_str->data = ngx_pnalloc(r->pool, display_value.length + 1);
+        if (sid_str->data == NULL) {
+            gss_release_buffer(&minor_status, &value);
+            gss_release_buffer(&minor_status, &display_value);
+            return NGX_ERROR;
+        }
+
+        ngx_memcpy(sid_str->data, display_value.value, display_value.length);
+        sid_str->data[display_value.length] = '\0';
+        sid_str->len = display_value.length;
+
+        spnego_debug1("Retrieved SID from logon_info: %V", sid_str);
+
+        gss_release_buffer(&minor_status, &value);
+        gss_release_buffer(&minor_status, &display_value);
+        return NGX_OK;
+    }
+
+    if (value.length > 0 || display_value.length > 0) {
+        gss_release_buffer(&minor_status, &value);
+        gss_release_buffer(&minor_status, &display_value);
+    }
+
+    spnego_log_error("No SID found in PAC data. Ensure Active Directory is configured to send MS-PAC and MIT Kerberos is built with PAC support");
     return NGX_ERROR;
 }
