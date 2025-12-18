@@ -1939,21 +1939,6 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
     size_t domain_sid_len = 0;
     size_t user_sid_len = 0;
 
-    spnego_debug1("PAC data length: %d bytes", (int)pac_len);
-    
-    /* Dump relevant sections for debugging */
-    if (pac_len >= 0x100) {
-        spnego_debug0("PAC data dump (offsets 0x60-0x9F):");
-        for (size_t i = 0x60; i < 0xA0 && i < pac_len; i += 16) {
-            spnego_debug3("  0x%02x: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-                (int)i,
-                pac_data[i], pac_data[i+1], pac_data[i+2], pac_data[i+3],
-                pac_data[i+4], pac_data[i+5], pac_data[i+6], pac_data[i+7],
-                pac_data[i+8], pac_data[i+9], pac_data[i+10], pac_data[i+11],
-                pac_data[i+12], pac_data[i+13], pac_data[i+14], pac_data[i+15]);
-        }
-    }
-
     /* Strategy: Find ALL SIDs in the PAC data, then identify which are domain and user SIDs
      * Domain SID: typically has 4 sub-authorities (S-1-5-21-XXX-XXX-XXX-XXX)
      * User SID: has 5 sub-authorities (domain SID + RID) (S-1-5-21-XXX-XXX-XXX-XXX-RID)
@@ -1976,30 +1961,24 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
         if (ptr[0] == 0x01 && ptr[1] >= 0x01 && ptr[1] <= 0x0F &&
             ptr[2] == 0x00 && ptr[3] == 0x00 && ptr[4] == 0x00 &&
             ptr[5] == 0x00 && ptr[6] == 0x00 && ptr[7] == 0x05) {
-            
+
             unsigned char sub_auth_count = ptr[1];
             size_t sid_len = 8 + sub_auth_count * 4;
 
             if (ptr + sid_len <= end) {
                 /* Read the last sub-authority (potential RID) */
                 uint32_t last_sub_auth = read_uint32_le(ptr + 8 + (sub_auth_count - 1) * 4);
-                
+
                 candidates[candidate_count].ptr = ptr;
                 candidates[candidate_count].len = sid_len;
                 candidates[candidate_count].sub_auth_count = sub_auth_count;
                 candidates[candidate_count].last_sub_auth = last_sub_auth;
-                
-                spnego_debug3("Found SID candidate %d at offset 0x%x: sub_auths=%d, last_sub_auth=%ud",
-                             candidate_count, (int)(ptr - pac_data), 
-                             sub_auth_count, last_sub_auth);
-                
+
                 candidate_count++;
             }
         }
         ptr++;
     }
-
-    spnego_debug1("Found %d SID candidates", candidate_count);
 
     /* Analyze candidates to find domain SID and user SID
      * Logic:
@@ -2013,15 +1992,13 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
         if (candidates[i].sub_auth_count == 5) {
             /* This could be the user SID */
             uint32_t rid = candidates[i].last_sub_auth;
-            
+
             /* Windows user RIDs are typically >= 1000 for regular users */
             if (rid >= 1000 && rid < 100000000) {
                 user_sid_ptr = candidates[i].ptr;
                 user_sid_len = candidates[i].len;
                 user_rid = rid;
-                
-                spnego_debug2("Identified user SID candidate at offset 0x%x with RID=%ud",
-                             (int)(user_sid_ptr - pac_data), user_rid);
+
                 break;
             }
         }
@@ -2029,20 +2006,19 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
 
     /* If no 5-subauth SID found, look for any SID with your expected RID */
     if (!user_sid_ptr && candidate_count > 0) {
-        spnego_debug0("No 5-subauth user SID found, checking all candidates for valid RID");
         
         for (int i = 0; i < candidate_count; i++) {
             uint32_t rid = candidates[i].last_sub_auth;
-            
+
             /* Check if this could be a valid user RID */
             if (rid >= 500 && rid < 100000000) {
                 /* Check if there's a matching domain SID (one less sub-authority) */
                 int has_matching_domain = 0;
-                
+
                 for (int j = 0; j < candidate_count; j++) {
                     if (i != j && candidates[j].sub_auth_count == candidates[i].sub_auth_count - 1) {
                         /* Check if first N-1 sub-authorities match */
-                        if (ngx_memcmp(candidates[i].ptr + 8, candidates[j].ptr + 8, 
+                        if (ngx_memcmp(candidates[i].ptr + 8, candidates[j].ptr + 8,
                                       (candidates[j].sub_auth_count) * 4) == 0) {
                             has_matching_domain = 1;
                             domain_sid_ptr = candidates[j].ptr;
@@ -2051,14 +2027,12 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
                         }
                     }
                 }
-                
+
                 if (has_matching_domain || candidates[i].sub_auth_count >= 4) {
                     user_sid_ptr = candidates[i].ptr;
                     user_sid_len = candidates[i].len;
                     user_rid = rid;
-                    
-                    spnego_debug2("Selected user SID at offset 0x%x with RID=%ud",
-                                 (int)(user_sid_ptr - pac_data), user_rid);
+
                     break;
                 }
             }
@@ -2067,20 +2041,19 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
 
     /* If we have a user SID, convert it directly */
     if (user_sid_ptr && user_sid_len > 0) {
-        if (ngx_http_auth_spnego_sid_to_string(r, user_sid_ptr, user_sid_len, 
+        if (ngx_http_auth_spnego_sid_to_string(r, user_sid_ptr, user_sid_len,
                                                sid_str) != NGX_OK) {
             spnego_log_error("Failed to convert user SID to string");
             return NGX_ERROR;
         }
+
         
-        spnego_debug2("Extracted complete user SID: %V (RID=%ud)", sid_str, user_rid);
         return NGX_OK;
     }
 
     /* Fallback: If we only found domain SID, try to extract RID from fixed offsets */
     if (!user_sid_ptr && candidate_count > 0) {
-        spnego_log_error("Found SID candidates but could not identify user SID");
-        
+
         /* Find the best domain SID candidate (4 sub-authorities) */
         for (int i = 0; i < candidate_count; i++) {
             if (candidates[i].sub_auth_count == 4) {
@@ -2089,33 +2062,27 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
                 break;
             }
         }
-        
+
         if (domain_sid_ptr) {
             ngx_str_t domain_sid = ngx_null_string;
-            
+
             /* Try multiple RID offsets */
             uint32_t rid_candidates[8];
             int rid_idx = 0;
-            
+
             for (size_t offset = 0x60; offset <= 0x78 && offset + 4 <= pac_len; offset += 4) {
                 rid_candidates[rid_idx++] = read_uint32_le(pac_data + offset);
             }
-            
-            /* Log all RID candidates */
-            spnego_debug0("RID candidates from fixed offsets:");
-            for (int i = 0; i < rid_idx; i++) {
-                spnego_debug2("  Offset 0x%x: %ud", 0x60 + i * 4, rid_candidates[i]);
-            }
-            
+
+
             /* Find most likely RID */
             for (int i = 0; i < rid_idx; i++) {
                 if (rid_candidates[i] >= 1000 && rid_candidates[i] < 100000000) {
                     user_rid = rid_candidates[i];
-                    spnego_debug1("Selected RID candidate: %ud", user_rid);
                     break;
                 }
             }
-            
+
             if (user_rid == 0 && rid_idx > 0) {
                 /* Use first non-zero value */
                 for (int i = 0; i < rid_idx; i++) {
@@ -2125,11 +2092,10 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
                     }
                 }
             }
-            
+
             /* Convert domain SID and append RID */
-            if (ngx_http_auth_spnego_sid_to_string(r, domain_sid_ptr, domain_sid_len, 
+            if (ngx_http_auth_spnego_sid_to_string(r, domain_sid_ptr, domain_sid_len,
                                                    &domain_sid) != NGX_OK) {
-                spnego_log_error("Failed to convert domain SID to string");
                 return NGX_ERROR;
             }
 
@@ -2140,19 +2106,14 @@ ngx_http_auth_spnego_parse_pac_logon_info(ngx_http_request_t *r,
             }
 
             u_char *p = sid_str->data;
-            p = ngx_slprintf(p, sid_str->data + full_sid_len, "%V-%ud", 
+            p = ngx_slprintf(p, sid_str->data + full_sid_len, "%V-%ud",
                             &domain_sid, user_rid);
             sid_str->len = p - sid_str->data;
-
-            spnego_debug3("Constructed user SID: %V (domain: %V, RID: %ud)", 
-                         sid_str, &domain_sid, user_rid);
 
             return NGX_OK;
         }
     }
 
-    spnego_log_error("Could not extract user SID from PAC data (found %d SID candidates)", 
-                     candidate_count);
     return NGX_ERROR;
 }
 
